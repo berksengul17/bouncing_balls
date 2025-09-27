@@ -5,145 +5,135 @@
 #include <Wire.h>
 
 TFT_eSPI tft = TFT_eSPI();
-TFT_eSprite sprite = TFT_eSprite(&tft);
+TFT_eSprite bgSprite = TFT_eSprite(&tft);      // static background
+TFT_eSprite circleSprite = TFT_eSprite(&tft);  // moving circles
+TFT_eSprite ball = TFT_eSprite(&tft);
 
 Adafruit_MPU6050 mpu;
 
 const int R = 3;
 const int PADDING = 9;
-const int DIAMETER = 240; // 240x240 display
+const int ORIGINAL_DIAMETER = 240;
+const int DIAMETER = 234; // 240x240 display
+const int CIRCLE_SPRITE_LENGTH = 226;
 const int SR = DIAMETER / 2;
-const int DR = SR - R; // max drawable radius
+const int DR = SR - R; 
 const int32_t BG_COLOR = 0x18a3;
 
 int xOffset = SR % PADDING, yOffset = SR % PADDING;
-
-int cellX = (SR - xOffset) / PADDING;
-int cellY = (SR - yOffset) / PADDING;
-
+int bgSpriteOffset = ceil((ORIGINAL_DIAMETER - DIAMETER) / 2.0);
+int circleSpriteOffset = ceil((DIAMETER - CIRCLE_SPRITE_LENGTH) / 2.0);
 int nx = ceil((DIAMETER - xOffset) / (float)PADDING);
 int ny = ceil((DIAMETER - yOffset) / (float)PADDING);
 
 float ax, ay;
-
 unsigned long lastUpdate = 0;
-const int frameDelay = 30;  // ms between frames
-
-// if a point is (-1, -1) then it means there is no circle drawn there
-struct Point {
-  int x;
-  int y;
-  Point(int xVal = -1, int yVal = -1) : x(xVal), y(yVal) {}
-};
+const int frameDelay = 30;  // ms
 
 struct ActiveCircle {
-  int cellX;
-  int cellY;
+  float x, y, vx, vy;
+  ActiveCircle(float x=-1, float y=-1, float vx=5, float vy=5)
+      : x(x), y(y), vx(vx), vy(vy) {}
 };
 
-Point* circles;
-bool *occupied;
-
-const int NUM_CIRCLES = 150;   // how many you want
+const int NUM_CIRCLES = 1;
 ActiveCircle active[NUM_CIRCLES];
 
-inline Point& AT(Point* circles, int y, int x, int nx) {
-    return circles[y * nx + x];
-}
-
-// given the center of the circle can we draw it without overflow
-bool isInBounds(int x, int y) {
-  int dx = SR - x;
-  int dy = SR - y;
+bool isInBounds(float x, float y) {
+  float dx = SR - x;
+  float dy = SR - y;
   return dx*dx + dy*dy <= DR*DR;
 }
 
-int pixelToCell(int pixel, int offset) {
-  return (pixel - offset) / PADDING;
+bool checkForCircleCollision(int idx, float x, float y) {
+  for (int i=0; i<NUM_CIRCLES; i++) {
+    if (i == idx) continue;
+    ActiveCircle c = active[i];
+    float dx = c.x - x;
+    float dy = c.y - y;
+    float dist = dx*dx + dy*dy;
+    if (dist <= (2*R)*(2*R)) return true;
+  }
+  return false;
 }
 
-void placeCircles() {
+bool isColliding(int idx, float x, float y) {
+  return (checkForCircleCollision(idx, x, y) || !isInBounds(x, y));
+}
+
+void initBackground() {
+  for (int x=xOffset; x<DIAMETER; x+=PADDING) {
+    for (int y=yOffset; y<DIAMETER; y+=PADDING) {
+      if (!isInBounds(x, y)) continue;
+      bgSprite.fillCircle(x, y, R, BG_COLOR);
+    }
+  }
+}
+
+void initActiveCircles() {
   int count = 0;
   for (int y = 0; y < ny && count < NUM_CIRCLES; y++) {
     for (int x = 0; x < nx && count < NUM_CIRCLES; x++) {
-      Point p = AT(circles, y, x, nx);
-      if (p.x == -1 || p.y == -1) continue; // skip invalid cells
-
-      active[count].cellX = x;
-      active[count].cellY = y;
-
-      tft.fillCircle(p.x, p.y, R, TFT_BLUE);
+      if (!isInBounds(x*PADDING + xOffset, y*PADDING + yOffset)) continue;
+      active[count].x = x*PADDING + xOffset;
+      active[count].y = y*PADDING + yOffset;
       count++;
     }
   }
 }
 
-void initBackground() {
-  // shift so center aligns
-  for (int x=xOffset; x<DIAMETER; x+=PADDING) {
-    for (int y=yOffset; y<DIAMETER; y+=PADDING) {
-      if(!isInBounds(x, y)) continue; 
-      tft.fillCircle(x, y, R, BG_COLOR);
+void updatePhysics(float ax, float ay) {
+  if (fabs(ax) < 0.4 && fabs(ay) < 0.4) return;
 
-      int cX = pixelToCell(x, xOffset);
-      int cY = pixelToCell(y, yOffset);
+  for (int i=0; i<NUM_CIRCLES; i++) {
+    ActiveCircle &c = active[i];
 
-      AT(circles, cY, cX, nx) = {x, y};
+    // apply acceleration
+    c.vx += ax * 2.0;
+    c.vy -= ay * 2.0;
+
+    // damping
+    c.vx *= 0.95;
+    c.vy *= 0.95;
+
+    float newX = c.x + c.vx;
+    float newY = c.y + c.vy;
+
+    if (isColliding(i, newX, newY)) {
+      c.vx = -c.vx * 0.8;
+      c.vy = -c.vy * 0.8;
+    } else {
+      c.x = newX;
+      c.y = newY;
     }
   }
 }
 
-// get the acceleration in the x and y and update frame accordingly
-void updateFrame(float ax, float ay) {
-  int updateX = 0, updateY = 0;
-  // X-axis controlled by IMU tilt
-  if (ax > 0.4) updateX = 1;
-  else if (ax < -0.4) updateX = -1;
+void drawFrame() {
+  bgSprite.fillSprite(TFT_BLACK);
+  circleSprite.fillSprite(TFT_BLACK);
+  initBackground();
 
-  // Y-axis controlled by IMU tilt
-  if (ay > 0.4) updateY = -1;
-  else if (ay < -0.4) updateY = 1;
-  else updateY = 1;  // 👈 default downward pull
+  for (int i=0; i<NUM_CIRCLES; i++) {
+    ActiveCircle c = active[i];
+    int x = c.x;
+    int y = c.y;
 
-  // Serial.printf("ax: %f | ay: %f | updateX: %d | updateY: %d", ax, ay, updateX, updateY);
+    if (fabs(c.vx) < 0.2 && fabs(c.vy) < 0.2) {  
+      int cellX = ceil(x / PADDING);
+      int cellY = ceil(y / PADDING);
 
-  for (int i = 0; i < NUM_CIRCLES; i++) {
-    int oldIndex = active[i].cellY * nx + active[i].cellX;
+      x = cellX * R;
+      y = cellY * R;
 
-    int nextX = active[i].cellX + updateX;
-    int nextY = active[i].cellY + updateY;
+      Serial.printf("cellX: %d, cellY: %d\n", cellX, cellY);
+    }
 
-    // clamp to grid
-    if (nextX < 0) nextX = 0;
-    if (nextX >= nx) nextX = nx - 1;
-    if (nextY < 0) nextY = 0;
-    if (nextY >= ny) nextY = ny - 1;
-
-    int newIndex = nextY * nx + nextX;
-
-    // skip if occupied
-    if (occupied[newIndex]) continue;
-
-    Point candidate = AT(circles, nextY, nextX, nx);
-    if (candidate.x == -1 || candidate.y == -1) continue;
-
-    // erase old circle
-    Point oldP = AT(circles, active[i].cellY, active[i].cellX, nx);
-    tft.fillCircle(oldP.x, oldP.y, R, BG_COLOR);
-
-    // free old cell
-    occupied[oldIndex] = false;
-
-    // update
-    active[i].cellX = nextX;
-    active[i].cellY = nextY;
-
-    // occupy new cell
-    occupied[newIndex] = true;
-
-    // draw new
-    tft.fillCircle(candidate.x, candidate.y, R, TFT_BLUE);
+    circleSprite.fillCircle(x - circleSpriteOffset, y - circleSpriteOffset, R, TFT_BLUE);
   }
+
+  circleSprite.pushToSprite(&bgSprite, circleSpriteOffset, circleSpriteOffset, TFT_BLACK);
+  bgSprite.pushSprite(bgSpriteOffset, bgSpriteOffset);
 }
 
 void setup() {
@@ -151,23 +141,23 @@ void setup() {
 
   if (!mpu.begin()) {
     Serial.println("Failed to find MPU6050 chip");
-    while (1) {
-      delay(10);
-    }
+    while (1) delay(10);
   }
   Serial.println("MPU6050 Found!");
 
   tft.begin();
   tft.setRotation(0);
   tft.fillScreen(TFT_BLACK);
+  
+  bgSprite.setColorDepth(16);
+  bgSprite.createSprite(DIAMETER, DIAMETER);
+  bgSprite.fillSprite(TFT_BLACK);
 
-  circles = new Point[ny*nx];
-  occupied = new bool[ny*nx];
-  for (int i = 0; i < nx * ny; i++) {
-    occupied[i] = false;
-  }
-  initBackground();
-  placeCircles();
+  initActiveCircles();
+
+  circleSprite.setColorDepth(16);
+  circleSprite.createSprite(CIRCLE_SPRITE_LENGTH, CIRCLE_SPRITE_LENGTH);
+  drawFrame();
 }
 
 void loop() {
@@ -176,11 +166,11 @@ void loop() {
 
   ax = a.acceleration.x;
   ay = a.acceleration.y;
-  
+
   unsigned long now = millis();
   if (now - lastUpdate > frameDelay) {
     lastUpdate = now;
-    updateFrame(ax, ay);
+    updatePhysics(ax, ay);
+    drawFrame();
   }
 }
-
