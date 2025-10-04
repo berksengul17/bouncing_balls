@@ -4,6 +4,12 @@
 #include <Adafruit_Sensor.h>
 #include <Wire.h>
 
+struct ActiveCircle {
+  float x, y, oldX, oldY, vx, vy;
+  ActiveCircle(float x=-1, float y=-1, float vx=5, float vy=5)
+      : x(x), y(y), oldX(x), oldY(y), vx(vx), vy(vy) {}
+};
+
 TFT_eSPI tft = TFT_eSPI();
 TFT_eSprite bgSprite = TFT_eSprite(&tft);      // static background
 TFT_eSprite circleSprite = TFT_eSprite(&tft);  // moving circles
@@ -14,11 +20,15 @@ Adafruit_MPU6050 mpu;
 const int R = 3;
 const int PADDING = 9;
 const int ORIGINAL_DIAMETER = 240;
-const int DIAMETER = 234; // 240x240 display
+const int DIAMETER = 226; // 240x240 display
 const int CIRCLE_SPRITE_LENGTH = 226;
 const int SR = DIAMETER / 2;
 const int DR = SR - R; 
 const int32_t BG_COLOR = 0x18a3;
+
+const int NUM_CIRCLES = 10;
+const float VX_LIMIT = 1.0;
+const float VY_LIMIT = 1.0;
 
 int xOffset = SR % PADDING, yOffset = SR % PADDING;
 int bgSpriteOffset = ceil((ORIGINAL_DIAMETER - DIAMETER) / 2.0);
@@ -30,19 +40,17 @@ float ax, ay;
 unsigned long lastUpdate = 0;
 const int frameDelay = 30;  // ms
 
-struct ActiveCircle {
-  float x, y, vx, vy;
-  ActiveCircle(float x=-1, float y=-1, float vx=5, float vy=5)
-      : x(x), y(y), vx(vx), vy(vy) {}
-};
-
-const int NUM_CIRCLES = 1;
 ActiveCircle active[NUM_CIRCLES];
+TFT_eSprite* balls[NUM_CIRCLES];
 
 bool isInBounds(float x, float y) {
   float dx = SR - x;
   float dy = SR - y;
   return dx*dx + dy*dy <= DR*DR;
+}
+
+bool isUnderSpeedLimit(float vx, float vy) {
+  return fabs(vx) < VX_LIMIT && fabs(vy) < VY_LIMIT;
 }
 
 bool checkForCircleCollision(int idx, float x, float y) {
@@ -92,9 +100,16 @@ void updatePhysics(float ax, float ay) {
     c.vx += ax * 2.0;
     c.vy -= ay * 2.0;
 
+    Serial.printf("vx: %f | vy: %f\n", c.vx, c.vy);
+
     // damping
     c.vx *= 0.95;
     c.vy *= 0.95;
+
+    if (isUnderSpeedLimit(c.vx, c.vy)) {
+      c.vx = 0.0;
+      c.vy = 0.0;
+    }
 
     float newX = c.x + c.vx;
     float newY = c.y + c.vy;
@@ -109,31 +124,68 @@ void updatePhysics(float ax, float ay) {
   }
 }
 
-void drawFrame() {
-  bgSprite.fillSprite(TFT_BLACK);
-  circleSprite.fillSprite(TFT_BLACK);
-  initBackground();
+void eraseOldCircle(float oldX, float oldY) {
+  if (oldX < 0 || oldY < 0) return;
 
-  for (int i=0; i<NUM_CIRCLES; i++) {
-    ActiveCircle c = active[i];
-    int x = c.x;
-    int y = c.y;
+  int px = (int)oldX;
+  int py = (int)oldY;
 
-    if (fabs(c.vx) < 0.2 && fabs(c.vy) < 0.2) {  
-      int cellX = ceil(x / PADDING);
-      int cellY = ceil(y / PADDING);
+  uint16_t *bgBuf = (uint16_t*) bgSprite.getPointer();
+  int bgW = bgSprite.width();
 
-      x = cellX * R;
-      y = cellY * R;
+  uint16_t *eraseBuf = (uint16_t*) circleSprite.getPointer();
+  int ew = circleSprite.width();
+  int eh = circleSprite.height();
 
-      Serial.printf("cellX: %d, cellY: %d\n", cellX, cellY);
+  for (int yy = 0; yy < eh; yy++) {
+    for (int xx = 0; xx < ew; xx++) {
+      int bx = px - R + xx;
+      int by = py - R + yy;
+
+      // Bounds check inside bgSprite
+      if (bx >= 0 && bx < bgW && by >= 0 && by < bgSprite.height()) {
+        eraseBuf[yy * ew + xx] = bgBuf[by * bgW + bx];
+      } else {
+        eraseBuf[yy * ew + xx] = TFT_BLACK; // fallback if out of bounds
+      }
     }
-
-    circleSprite.fillCircle(x - circleSpriteOffset, y - circleSpriteOffset, R, TFT_BLUE);
   }
 
-  circleSprite.pushToSprite(&bgSprite, circleSpriteOffset, circleSpriteOffset, TFT_BLACK);
-  bgSprite.pushSprite(bgSpriteOffset, bgSpriteOffset);
+  // Push restored block back to TFT
+  circleSprite.pushSprite(px - R + bgSpriteOffset, py - R + bgSpriteOffset);
+}
+
+void drawFrame() {
+  for (int i=0; i<NUM_CIRCLES; i++) {
+    ActiveCircle &c = active[i];
+
+    // ---- ERASE old position ----
+    if (c.oldX >= 0 && c.oldY >= 0) {
+      balls[i]->fillSprite(TFT_BLACK);  // clean the mini-sprite
+      balls[i]->fillCircle(R, R, R, TFT_BLACK);  // draw background dot color
+      balls[i]->pushSprite((int)c.oldX - R + bgSpriteOffset,
+                           (int)c.oldY - R + bgSpriteOffset);
+    }
+
+    // Snap to grid if needed
+    if (isUnderSpeedLimit(c.vx, c.vy)) {
+      int cellX = round((c.x - xOffset) / (float)PADDING);
+      int cellY = round((c.y - yOffset) / (float)PADDING);
+      c.x = cellX * PADDING + xOffset;
+      c.y = cellY * PADDING + yOffset;
+    }
+
+    // ---- DRAW new circle ----
+    balls[i]->fillSprite(TFT_BLACK);
+    balls[i]->fillCircle(R, R, R, TFT_BLUE);
+    balls[i]->pushSprite((int)c.x - R + bgSpriteOffset,
+                         (int)c.y - R + bgSpriteOffset,
+                         TFT_BLACK);
+
+    // update old position
+    c.oldX = c.x;
+    c.oldY = c.y;
+  }
 }
 
 void setup() {
@@ -149,14 +201,19 @@ void setup() {
   tft.setRotation(0);
   tft.fillScreen(TFT_BLACK);
   
-  bgSprite.setColorDepth(16);
-  bgSprite.createSprite(DIAMETER, DIAMETER);
-  bgSprite.fillSprite(TFT_BLACK);
-
+  // bgSprite.setColorDepth(16);
+  // bgSprite.createSprite(DIAMETER, DIAMETER);
+  // bgSprite.fillSprite(TFT_BLACK);
+  
+  //initBackground();
+  // bgSprite.pushSprite(bgSpriteOffset, bgSpriteOffset, TFT_BLACK);
+  
   initActiveCircles();
-
-  circleSprite.setColorDepth(16);
-  circleSprite.createSprite(CIRCLE_SPRITE_LENGTH, CIRCLE_SPRITE_LENGTH);
+  for (int i = 0; i < NUM_CIRCLES; i++) {
+    balls[i] = new TFT_eSprite(&tft);
+    balls[i]->setColorDepth(16);
+    balls[i]->createSprite(2*R+2, 2*R+2);
+  }
   drawFrame();
 }
 
@@ -166,11 +223,11 @@ void loop() {
 
   ax = a.acceleration.x;
   ay = a.acceleration.y;
-
+  updatePhysics(ax, ay);
+  
   unsigned long now = millis();
   if (now - lastUpdate > frameDelay) {
     lastUpdate = now;
-    updatePhysics(ax, ay);
     drawFrame();
   }
 }
